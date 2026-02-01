@@ -2,9 +2,19 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <ArduinoJson.h>
+
 
 static const int WIDTH  = 240;
 static const int HEIGHT = 135;
+
+static const char* TEXT_IDLE = "Hold M5 button\nto ask your question";
+static const char* TEXT_CONNECTING = "Connecting...";
+static const char* TEXT_TRANSCRIBING = "Transcribing...";
+static const char* TEXT_THINKING = "Thinking...";
+static const char* TEXT_MIC_ERROR = "Mic error";
+static const char* TEXT_COULDNT_HEAR = "Couldn't hear.\nTry again.";
+static const char* TEXT_RECORDING_PREFIX = "Recording... ";
 
 const char* WIFI_SSID     = "name";
 const char* WIFI_PASS     = "password";
@@ -12,13 +22,98 @@ const char* OPENAI_API_KEY = "sk-proj-xxxx";
 
 // Audio settings
 static const int SAMPLE_RATE = 16000;
-static const int RECORD_SECONDS = 5;
-static const int RECORD_SAMPLES = SAMPLE_RATE * RECORD_SECONDS;
+static const int MAX_RECORD_SECONDS = 10;
+static const int MAX_RECORD_SAMPLES = SAMPLE_RATE * MAX_RECORD_SECONDS;
 static int16_t* audioBuffer = nullptr;
+static int recordedSamples = 0;
 
-String response = "Press A\nto ask a question";
+String response = TEXT_IDLE;
+static unsigned long responseShownAtMs = 0;
+static bool idleScreenShown = true;
+static unsigned long lastRedrawMs = 0;
+
+// Forward declarations
+void drawBatteryOverlay(M5Canvas &canvas);
+void drawWifiStatus(M5Canvas &canvas);
+
+static String normalizeDisplayText(const String &text) {
+  String out = text;
+  // Handle escaped unicode sequences (with or without backslash)
+  out.replace("\\u00C7", "C");
+  out.replace("u00C7", "C");
+  out.replace("\\u00E7", "c");
+  out.replace("u00E7", "c");
+  out.replace("\\u011E", "G");
+  out.replace("u011E", "G");
+  out.replace("\\u011F", "g");
+  out.replace("u011F", "g");
+  out.replace("\\u0130", "I");
+  out.replace("u0130", "I");
+  out.replace("\\u0131", "i");
+  out.replace("u0131", "i");
+  out.replace("\\u00D6", "O");
+  out.replace("u00D6", "O");
+  out.replace("\\u00F6", "o");
+  out.replace("u00F6", "o");
+  out.replace("\\u015E", "S");
+  out.replace("u015E", "S");
+  out.replace("\\u015F", "s");
+  out.replace("u015F", "s");
+  out.replace("\\u00DC", "U");
+  out.replace("u00DC", "U");
+  out.replace("\\u00FC", "u");
+  out.replace("u00FC", "u");
+
+  out.replace("\u00C7", "C");
+  out.replace("\u00E7", "c");
+  out.replace("\u011E", "G");
+  out.replace("\u011F", "g");
+  out.replace("\u0130", "I");
+  out.replace("\u0131", "i");
+  out.replace("\u00D6", "O");
+  out.replace("\u00F6", "o");
+  out.replace("\u015E", "S");
+  out.replace("\u015F", "s");
+  out.replace("\u00DC", "U");
+  out.replace("\u00FC", "u");
+  return out;
+}
+
+static String extractTranscriptionText(const String &json) {
+  DynamicJsonDocument doc(4096);
+  DeserializationError err = deserializeJson(doc, json);
+  if (err) return "";
+  if (!doc.containsKey("text")) return "";
+  return doc["text"].as<String>();
+}
+
+static String extractResponseText(const String &json) {
+  DynamicJsonDocument doc(16384);
+  DeserializationError err = deserializeJson(doc, json);
+  if (err) return "";
+
+  if (doc.containsKey("output_text")) {
+    return doc["output_text"].as<String>();
+  }
+
+  if (doc.containsKey("output") && doc["output"].is<JsonArray>()) {
+    for (JsonObject item : doc["output"].as<JsonArray>()) {
+      if (item["type"] == "message" && item["content"].is<JsonArray>()) {
+        for (JsonObject content : item["content"].as<JsonArray>()) {
+          const char* ctype = content["type"];
+          if (ctype && (!strcmp(ctype, "output_text") || !strcmp(ctype, "text"))) {
+            return content["text"].as<String>();
+          }
+        }
+      }
+    }
+  }
+
+  return "";
+}
 
 void drawScreen(const String &text) {
+  String displayText = normalizeDisplayText(text);
   M5Canvas canvas(&M5.Display);
   canvas.createSprite(WIDTH, HEIGHT);
   canvas.fillSprite(TFT_BLACK);
@@ -27,8 +122,8 @@ void drawScreen(const String &text) {
   canvas.setTextFont(2);
 
   int lineCount = 1;
-  for (unsigned int i = 0; i < text.length(); i++) {
-    if (text[i] == '\n') lineCount++;
+  for (unsigned int i = 0; i < displayText.length(); i++) {
+    if (displayText[i] == '\n') lineCount++;
   }
 
   int lineHeight = canvas.fontHeight() + 4;
@@ -36,30 +131,67 @@ void drawScreen(const String &text) {
 
   int lineNum = 0;
   int lineStart = 0;
-  for (unsigned int i = 0; i <= text.length(); i++) {
-    if (i == text.length() || text[i] == '\n') {
-      String line = text.substring(lineStart, i);
+  for (unsigned int i = 0; i <= displayText.length(); i++) {
+    if (i == displayText.length() || displayText[i] == '\n') {
+      String line = displayText.substring(lineStart, i);
       canvas.drawString(line, WIDTH / 2, startY + lineNum * lineHeight);
       lineNum++;
       lineStart = i + 1;
     }
   }
+  drawWifiStatus(canvas);
+  // draw battery overlay (percent + icon)
+  drawBatteryOverlay(canvas);
 
   canvas.pushSprite(0, 0);
   canvas.deleteSprite();
 }
 
+void drawWifiStatus(M5Canvas &canvas) {
+  const int x = 6;
+  const int y = 5;
+  const int bh = 14; // match battery icon height
+  const int r3 = bh / 2;     // outer arc radius
+  const int r2 = r3 - 2;
+  const int r1 = r3 - 4;
+  const int cx = x + r3;
+  const int cy = y + r3;
+
+  wl_status_t st = WiFi.status();
+  uint16_t color = (st == WL_CONNECTED) ? TFT_WHITE : TFT_DARKGREY;
+
+  int bars = 0;
+  if (st == WL_CONNECTED) {
+    int rssi = WiFi.RSSI();
+    if (rssi >= -60) bars = 3;
+    else if (rssi >= -75) bars = 2;
+    else bars = 1;
+  }
+
+  // draw iOS-style arcs (top half of circles) + dot
+  if (bars >= 1) canvas.drawCircle(cx, cy, r1, color);
+  if (bars >= 2) canvas.drawCircle(cx, cy, r2, color);
+  if (bars >= 3) canvas.drawCircle(cx, cy, r3, color);
+
+  // mask lower half to keep only top arcs
+  canvas.fillRect(x, cy, r3 * 2 + 2, r3 + 2, TFT_BLACK);
+
+  // center dot
+  if (bars >= 1) canvas.fillCircle(cx, cy, 1, color);
+}
+
 void drawProgress(int seconds) {
-  String msg = "Recording... " + String(seconds);
+  String msg = String(TEXT_RECORDING_PREFIX) + String(seconds);
   drawScreen(msg);
 }
 
 bool recordAudio() {
   Serial.println("\n========== RECORDING ==========");
+  Serial.println("Hold button A to record (max 10 seconds)...");
   
   if (!audioBuffer) {
-    Serial.printf("Allocating buffer: %d samples, %d bytes\n", RECORD_SAMPLES, RECORD_SAMPLES * sizeof(int16_t));
-    audioBuffer = (int16_t*)malloc(RECORD_SAMPLES * sizeof(int16_t));
+    Serial.printf("Allocating buffer: %d samples, %d bytes\n", MAX_RECORD_SAMPLES, MAX_RECORD_SAMPLES * sizeof(int16_t));
+    audioBuffer = (int16_t*)malloc(MAX_RECORD_SAMPLES * sizeof(int16_t));
     if (!audioBuffer) {
       Serial.println("ERROR: Failed to allocate audio buffer!");
       return false;
@@ -72,31 +204,60 @@ bool recordAudio() {
   Serial.println("Starting mic...");
   M5.Mic.begin();
   
+  recordedSamples = 0;
+  unsigned long startTime = millis();
   int samplesPerSecond = SAMPLE_RATE;
-  for (int sec = 0; sec < RECORD_SECONDS; sec++) {
-    Serial.printf("Recording second %d/%d...\n", sec + 1, RECORD_SECONDS);
-    drawProgress(RECORD_SECONDS - sec);
+  bool buttonReleased = false;
+
+  for (int sec = 0; sec < MAX_RECORD_SECONDS; sec++) {
+    // Update button state
+    M5.update();
+    
+    // Check if button A is still pressed
+    if (!M5.BtnA.isPressed()) {
+      buttonReleased = true;
+      Serial.printf("Button released at %d seconds\n", sec);
+      break;
+    }
+    
+    Serial.printf("Recording second %d/%d...\n", sec + 1, MAX_RECORD_SECONDS);
+    drawProgress(MAX_RECORD_SECONDS - sec);
+    
     M5.Mic.record(&audioBuffer[sec * samplesPerSecond], samplesPerSecond, SAMPLE_RATE);
     while (M5.Mic.isRecording()) {
+      M5.update();
+      
+      // Check button again during recording
+      if (!M5.BtnA.isPressed()) {
+        buttonReleased = true;
+        Serial.println("Button released during recording");
+        break;
+      }
       delay(10);
+    }
+    
+    recordedSamples += samplesPerSecond;
+    
+    if (buttonReleased) {
+      break;
     }
   }
   
   M5.Mic.end();
-  Serial.println("Recording complete");
+  Serial.printf("Recording complete: %d samples (%d seconds)\n", recordedSamples, recordedSamples / SAMPLE_RATE);
 
   // Audio stats
   int16_t minVal = 32767, maxVal = -32768;
   int64_t sum = 0;
-  for (int i = 0; i < RECORD_SAMPLES; i++) {
+  for (int i = 0; i < recordedSamples; i++) {
     if (audioBuffer[i] < minVal) minVal = audioBuffer[i];
     if (audioBuffer[i] > maxVal) maxVal = audioBuffer[i];
     sum += abs(audioBuffer[i]);
   }
-  Serial.printf("Audio stats: min=%d, max=%d, avg=%lld\n", minVal, maxVal, sum / RECORD_SAMPLES);
+  Serial.printf("Audio stats: min=%d, max=%d, avg=%lld\n", minVal, maxVal, sum / recordedSamples);
   Serial.println("================================\n");
   
-  return true;
+  return recordedSamples > SAMPLE_RATE; // At least 1 second of audio
 }
 
 void createWavHeader(uint8_t* header, int dataSize) {
@@ -145,7 +306,7 @@ String transcribeAudio() {
   }
   Serial.println("Connected");
 
-  int audioDataSize = RECORD_SAMPLES * sizeof(int16_t);
+  int audioDataSize = recordedSamples * sizeof(int16_t);
   uint8_t wavHeader[44];
   createWavHeader(wavHeader, audioDataSize);
 
@@ -218,33 +379,10 @@ String transcribeAudio() {
   Serial.println("Whisper response body:");
   Serial.println(response);
 
-  int textIdx = response.indexOf("\"text\"");
-  if (textIdx < 0) {
+  String result = extractTranscriptionText(response);
+  if (result.length() == 0) {
     Serial.println("ERROR: No 'text' field in response!");
     return "No transcription";
-  }
-  
-  int start = response.indexOf('"', textIdx + 6);
-  if (start < 0) {
-    Serial.println("ERROR: Parse error!");
-    return "Parse error";
-  }
-  start++;
-  
-  String result;
-  bool escaped = false;
-  for (unsigned int i = start; i < response.length(); i++) {
-    char c = response[i];
-    if (escaped) {
-      result += c;
-      escaped = false;
-    } else if (c == '\\') {
-      escaped = true;
-    } else if (c == '"') {
-      break;
-    } else {
-      result += c;
-    }
   }
   
   Serial.println("Transcription: " + result);
@@ -307,41 +445,10 @@ String askGPT(const String &question) {
   Serial.println("GPT response:");
   Serial.println(resp);
 
-  int outIdx = resp.indexOf("output_text");
-  if (outIdx < 0) {
-    Serial.println("ERROR: No 'output_text' in response!");
+  String result = extractResponseText(resp);
+  if (result.length() == 0) {
+    Serial.println("ERROR: No output text in response!");
     return "No output";
-  }
-
-  int textKey = resp.indexOf("\"text\"", outIdx);
-  if (textKey < 0) {
-    Serial.println("ERROR: No 'text' field!");
-    return "No text";
-  }
-
-  int start = resp.indexOf('"', textKey + 6);
-  if (start < 0) {
-    Serial.println("ERROR: Parse error!");
-    return "Parse error";
-  }
-  start++;
-
-  String result;
-  bool esc = false;
-  for (unsigned int i = start; i < resp.length(); i++) {
-    char c = resp[i];
-    if (esc) {
-      if (c == 'n') result += '\n';
-      else if (c == 'u') { i += 4; result += '-'; }
-      else result += c;
-      esc = false;
-    } else if (c == '\\') {
-      esc = true;
-    } else if (c == '"') {
-      break;
-    } else {
-      result += c;
-    }
   }
 
   Serial.println("Extracted answer: " + result);
@@ -383,6 +490,54 @@ String wordWrap(const String &text, int maxChars) {
   return result;
 }
 
+// Read battery and convert to percent (best-effort for M5 devices)
+int getBatteryPercent() {
+  // M5 API kullan
+  int level = M5.Power.getBatteryLevel();
+  if (level >= 0 && level <= 100) return level;
+
+  // Fallback to voltage-based estimate
+  float v = M5.Power.getBatteryVoltage();
+  if (v > 20.0) v /= 1000.0; // some builds return mV
+
+  // Map 3.0V -> 0% and 4.2V -> 100%
+  if (v <= 0.0) return -1;
+  int pct = (int)((v - 3.0) / (4.2 - 3.0) * 100.0);
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  return pct;
+}
+
+// Draw small battery icon + percentage on the given canvas (top-right)
+void drawBatteryOverlay(M5Canvas &canvas) {
+  int pct = getBatteryPercent();
+
+  int bw = 34; // battery box width
+  int bh = 14; // battery box height
+  int bx = WIDTH - bw - 12; // leave some margin
+  int by = 5;
+
+  // Outline and terminal
+  canvas.drawRect(bx, by, bw, bh, TFT_WHITE);
+  canvas.fillRect(bx + bw, by + bh/3, 4, bh/3, TFT_WHITE);
+
+  if (pct >= 0) {
+    int fillW = map(pct, 0, 100, 2, bw - 4);
+    uint16_t color = (pct > 60) ? TFT_GREEN : (pct > 30) ? TFT_YELLOW : TFT_RED;
+    canvas.fillRect(bx + 2, by + 2, fillW, bh - 4, color);
+
+    canvas.setTextFont(2);
+    canvas.setTextDatum(MR_DATUM);
+    canvas.setTextColor(TFT_WHITE);
+    canvas.drawString(String(pct) + "%", bx - 6, by + bh/2);
+  } else {
+    canvas.setTextFont(2);
+    canvas.setTextDatum(MR_DATUM);
+    canvas.setTextColor(TFT_WHITE);
+    canvas.drawString("??%", bx - 6, by + bh/2);
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -395,7 +550,7 @@ void setup() {
   M5.begin(cfg);
   M5.Display.setRotation(1);
 
-  drawScreen("Connecting...");
+  drawScreen(TEXT_CONNECTING);
 
   Serial.print("Connecting to WiFi: ");
   Serial.println(WIFI_SSID);
@@ -411,47 +566,67 @@ void setup() {
   Serial.println(WiFi.localIP());
   Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
 
-  drawScreen("Press A\nto ask a question");
+  drawScreen(TEXT_IDLE);
+  idleScreenShown = true;
   Serial.println("\nReady! Press button A to ask a question.\n");
 }
 
 void loop() {
   M5.update();
 
-  if (M5.BtnA.wasClicked()) {
-    Serial.println("\n*** BUTTON A PRESSED ***\n");
+  if (M5.BtnA.wasPressed()) {
+    Serial.println("\n*** BUTTON A PRESSED ***");
+    Serial.println("Holding button to record... Release to stop.\n");
     Serial.printf("Free heap before recording: %d bytes\n", ESP.getFreeHeap());
     
     if (!recordAudio()) {
-      drawScreen("Mic error");
+      drawScreen(TEXT_MIC_ERROR);
       delay(2000);
-      drawScreen("Press A\nto ask a question");
+      drawScreen(TEXT_IDLE);
       return;
     }
 
     Serial.printf("Free heap after recording: %d bytes\n", ESP.getFreeHeap());
 
-    drawScreen("Transcribing...");
+    drawScreen(TEXT_TRANSCRIBING);
     String question = transcribeAudio();
 
     if (question.length() < 2 || question.startsWith("No ") || question.startsWith("Parse") || question.startsWith("Connection") || question.startsWith("Timeout")) {
       Serial.println("Transcription failed or empty");
-      drawScreen("Couldn't hear.\nTry again.");
+      drawScreen(TEXT_COULDNT_HEAR);
       delay(2000);
-      drawScreen("Press A\nto ask a question");
+      drawScreen(TEXT_IDLE);
       return;
     }
 
-    drawScreen("Thinking...");
+    drawScreen(TEXT_THINKING);
     String answer = askGPT(question);
     
     response = wordWrap(answer, 25);
     Serial.println("Final display text:");
     Serial.println(response);
     drawScreen(response);
+    responseShownAtMs = millis();
+    idleScreenShown = false;
     
     Serial.printf("Free heap at end: %d bytes\n", ESP.getFreeHeap());
     Serial.println("\n*** INTERACTION COMPLETE ***\n");
+  }
+
+  if (!idleScreenShown && responseShownAtMs > 0 && (millis() - responseShownAtMs) >= 20000) {
+    drawScreen(TEXT_IDLE);
+    responseShownAtMs = 0;
+    idleScreenShown = true;
+  }
+
+  // Periodic refresh so battery/charging indicator updates
+  if (millis() - lastRedrawMs >= 300) {
+    if (idleScreenShown) {
+      drawScreen(TEXT_IDLE);
+    } else if (responseShownAtMs > 0) {
+      drawScreen(response);
+    }
+    lastRedrawMs = millis();
   }
 
   delay(20);
